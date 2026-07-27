@@ -1,0 +1,411 @@
+// ICT Spot Trading Strategy for TrueMarkets (TrueX)
+// Targets BTC/USDC, ETH/USDC, SOL/USDC on TrueX spot exchange.
+//
+// Implements core ICT concepts:
+//   - Market Structure: Break of Structure (BOS) and Change of Character (CHoCH)
+//   - Order Blocks: Institutional supply/demand zones
+//   - Fair Value Gaps (FVG): Price imbalances / inefficiencies
+//   - Liquidity Sweeps: Equal highs/lows, previous session levels
+//   - Optimal Trade Entry (OTE): Fib retracement 62-79% of impulse
+//   - Kill Zones: London, New York, Asia session filtering
+//   - Premium/Discount: Trade longs from discount, shorts from premium
+
+//@version=6
+strategy("ICT Spot Strategy – TrueMarkets", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=5, commission_type=strategy.commission.percent, commission_value=0.1, slippage=2, initial_capital=10000, process_orders_on_close=false)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+
+// Structure
+swingLen       = input.int(5,    "Swing Detection Length",     minval=2,  group="Market Structure")
+structLookback = input.int(50,   "Structure Lookback Bars",    minval=10, group="Market Structure")
+
+// Order Blocks
+obLookback     = input.int(10,   "Order Block Lookback",       minval=3,  group="Order Blocks")
+obMitigated    = input.bool(true, "Remove Mitigated OBs",      group="Order Blocks")
+maxOBAge       = input.int(100,  "Max OB Age (bars)",          minval=20, group="Order Blocks")
+
+// Fair Value Gaps
+showFVG        = input.bool(true, "Show Fair Value Gaps",      group="FVG")
+fvgMinSize     = input.float(0.1, "Min FVG Size (%)",          minval=0.01, group="FVG")
+maxFVGAge      = input.int(50,   "Max FVG Age (bars)",         minval=10, group="FVG")
+
+// OTE Zone
+oteFibHigh     = input.float(0.79, "OTE Fib High",            minval=0.5,  maxval=1.0, group="OTE")
+oteFibLow      = input.float(0.62, "OTE Fib Low",             minval=0.5,  maxval=1.0, group="OTE")
+
+// Kill Zones (UTC)
+useKillZones   = input.bool(true,  "Use Kill Zone Filter",     group="Kill Zones")
+londonStart    = input.int(2,      "London Open (UTC)",         minval=0, maxval=23, group="Kill Zones")
+londonEnd      = input.int(5,      "London Close (UTC)",        minval=0, maxval=23, group="Kill Zones")
+nyStart        = input.int(7,      "New York Open (UTC)",       minval=0, maxval=23, group="Kill Zones")
+nyEnd          = input.int(10,     "New York Close (UTC)",      minval=0, maxval=23, group="Kill Zones")
+asiaStart      = input.int(20,     "Asia Open (UTC)",           minval=0, maxval=23, group="Kill Zones")
+asiaEnd        = input.int(0,      "Asia Close (UTC)",          minval=0, maxval=23, group="Kill Zones")
+
+// Risk Management
+atrLen          = input.int(14,    "ATR Length",                minval=5,   group="Risk")
+slAtrMult       = input.float(1.5, "Stop Loss ATR Mult",       minval=0.5, group="Risk")
+tpAtrMult       = input.float(3.0, "Take Profit ATR Mult",     minval=1.0, group="Risk")
+useTrailingStop  = input.bool(true, "Use Trailing Stop",        group="Risk")
+trailAtrMult    = input.float(2.0, "Trail Stop ATR Mult",      minval=0.5, group="Risk")
+
+// ─── MARKET STRUCTURE ─────────────────────────────────────────────────────────
+
+// Detect swing highs and lows
+swingHigh = ta.pivothigh(high, swingLen, swingLen)
+swingLow  = ta.pivotlow(low, swingLen, swingLen)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+var float prevSwingHigh = na
+var float prevSwingLow  = na
+
+var int lastSwingHighBar = na
+var int lastSwingLowBar  = na
+
+// Track higher highs / lower lows for structure
+var int trend = 0  // 1 = bullish, -1 = bearish
+
+if not na(swingHigh)
+    prevSwingHigh := lastSwingHigh
+    lastSwingHigh := swingHigh
+    lastSwingHighBar := bar_index - swingLen
+
+if not na(swingLow)
+    prevSwingLow := lastSwingLow
+    lastSwingLow := swingLow
+    lastSwingLowBar := bar_index - swingLen
+
+// Break of Structure (BOS) - continuation
+// Bullish BOS: price breaks above last swing high in uptrend
+// Bearish BOS: price breaks below last swing low in downtrend
+bullishBOS = not na(lastSwingHigh) and close > lastSwingHigh and trend == 1
+bearishBOS = not na(lastSwingLow) and close < lastSwingLow and trend == -1
+
+// Change of Character (CHoCH) - reversal
+// Bullish CHoCH: price breaks above last swing high while in downtrend
+// Bearish CHoCH: price breaks below last swing low while in uptrend
+bullishCHoCH = not na(lastSwingHigh) and close > lastSwingHigh and trend == -1
+bearishCHoCH = not na(lastSwingLow) and close < lastSwingLow and trend == 1
+
+// Update trend on structure breaks
+if bullishBOS or bullishCHoCH
+    trend := 1
+if bearishBOS or bearishCHoCH
+    trend := -1
+
+// Initialize trend if not set
+if trend == 0
+    if close > ta.sma(close, 50)
+        trend := 1
+    else
+        trend := -1
+
+// ─── ORDER BLOCKS ─────────────────────────────────────────────────────────────
+
+// Bullish OB: last bearish candle before a strong bullish move
+// Bearish OB: last bullish candle before a strong bearish move
+
+var float bullOBTop    = na
+var float bullOBBot    = na
+var int   bullOBBar    = na
+var bool  bullOBActive = false
+
+var float bearOBTop    = na
+var float bearOBBot    = na
+var int   bearOBBar    = na
+var bool  bearOBActive = false
+
+// Displacement detection: strong impulsive candle
+atrVal       = ta.atr(atrLen)
+displacement = math.abs(close - open) > atrVal * 1.5
+
+// Bullish displacement: find the last bearish candle before it
+bullishDisplacement = close > open and displacement and (bullishBOS or bullishCHoCH or (trend == 1 and close > ta.highest(high, 3)[1]))
+bearishDisplacement = close < open and displacement and (bearishBOS or bearishCHoCH or (trend == -1 and close < ta.lowest(low, 3)[1]))
+
+if bullishDisplacement
+    for i = 1 to obLookback
+        if close[i] < open[i]
+            bullOBTop    := open[i]
+            bullOBBot    := close[i]
+            bullOBBar    := bar_index - i
+            bullOBActive := true
+            break
+
+if bearishDisplacement
+    for i = 1 to obLookback
+        if close[i] > open[i]
+            bearOBTop    := close[i]
+            bearOBBot    := open[i]
+            bearOBBar    := bar_index - i
+            bearOBActive := true
+            break
+
+// Mitigate order blocks when price trades through them
+if obMitigated and bullOBActive
+    if close < bullOBBot
+        bullOBActive := false
+
+if obMitigated and bearOBActive
+    if close > bearOBTop
+        bearOBActive := false
+
+// Expire old OBs
+if bullOBActive and not na(bullOBBar) and (bar_index - bullOBBar) > maxOBAge
+    bullOBActive := false
+if bearOBActive and not na(bearOBBar) and (bar_index - bearOBBar) > maxOBAge
+    bearOBActive := false
+
+// ─── FAIR VALUE GAPS ──────────────────────────────────────────────────────────
+
+// Bullish FVG: candle[2].high < candle[0].low (gap up)
+// Bearish FVG: candle[2].low > candle[0].high (gap down)
+
+var float bullFVGTop    = na
+var float bullFVGBot    = na
+var int   bullFVGBar    = na
+var bool  bullFVGActive = false
+
+var float bearFVGTop    = na
+var float bearFVGBot    = na
+var int   bearFVGBar    = na
+var bool  bearFVGActive = false
+
+bullFVGCond = low > high[2] and ((low - high[2]) / close * 100) > fvgMinSize
+bearFVGCond = high < low[2] and ((low[2] - high) / close * 100) > fvgMinSize
+
+if bullFVGCond and showFVG
+    bullFVGTop    := low
+    bullFVGBot    := high[2]
+    bullFVGBar    := bar_index - 1
+    bullFVGActive := true
+
+if bearFVGCond and showFVG
+    bearFVGTop    := low[2]
+    bearFVGBot    := high
+    bearFVGBar    := bar_index - 1
+    bearFVGActive := true
+
+// FVG fill / mitigation
+if bullFVGActive and low <= bullFVGBot
+    bullFVGActive := false
+if bearFVGActive and high >= bearFVGTop
+    bearFVGActive := false
+
+// Expire old FVGs
+if bullFVGActive and not na(bullFVGBar) and (bar_index - bullFVGBar) > maxFVGAge
+    bullFVGActive := false
+if bearFVGActive and not na(bearFVGBar) and (bar_index - bearFVGBar) > maxFVGAge
+    bearFVGActive := false
+
+// ─── PREMIUM / DISCOUNT ZONES ────────────────────────────────────────────────
+
+// Using the range between last significant swing high and swing low
+rangeHigh  = ta.highest(high, structLookback)
+rangeLow   = ta.lowest(low, structLookback)
+rangeSize  = rangeHigh - rangeLow
+equilibrium = rangeLow + rangeSize * 0.5
+
+inDiscount = close < equilibrium
+inPremium  = close > equilibrium
+
+// ─── OTE (OPTIMAL TRADE ENTRY) ───────────────────────────────────────────────
+
+// OTE zone sits between 62% and 79% retracement of the last impulse move
+var float oteTop = na
+var float oteBot = na
+
+if bullishBOS or bullishCHoCH
+    if not na(lastSwingLow) and not na(lastSwingHigh)
+        impulseRange = lastSwingHigh - lastSwingLow
+        oteTop := lastSwingHigh - impulseRange * oteFibLow
+        oteBot := lastSwingHigh - impulseRange * oteFibHigh
+
+if bearishBOS or bearishCHoCH
+    if not na(lastSwingLow) and not na(lastSwingHigh)
+        impulseRange = lastSwingHigh - lastSwingLow
+        oteTop := lastSwingLow + impulseRange * oteFibHigh
+        oteBot := lastSwingLow + impulseRange * oteFibLow
+
+inOTEZone = not na(oteTop) and not na(oteBot) and close >= oteBot and close <= oteTop
+
+// ─── KILL ZONES ───────────────────────────────────────────────────────────────
+
+hr = hour(time, "UTC")
+
+inLondonKZ = hr >= londonStart and hr < londonEnd
+inNYKZ     = hr >= nyStart     and hr < nyEnd
+inAsiaKZ   = asiaStart > asiaEnd ? (hr >= asiaStart or hr < asiaEnd) : (hr >= asiaStart and hr < asiaEnd)
+
+inKillZone = not useKillZones or inLondonKZ or inNYKZ or inAsiaKZ
+
+// ─── LIQUIDITY LEVELS ─────────────────────────────────────────────────────────
+
+// Previous day high/low as liquidity targets
+prevDayHigh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+prevDayLow  = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+
+// Detect liquidity sweeps
+sweepAbove = high > prevDayHigh and close < prevDayHigh
+sweepBelow = low < prevDayLow and close > prevDayLow
+
+// ─── ENTRY SIGNALS ────────────────────────────────────────────────────────────
+
+// LONG ENTRY: Bullish confluence
+// 1. Bullish market structure (BOS or CHoCH) or bullish trend
+// 2. Price in discount zone
+// 3. Price touching/inside bullish OB or bullish FVG
+// 4. Ideally in OTE zone
+// 5. Inside kill zone
+// 6. Liquidity sweep below (stop hunt) confirmation is bonus
+
+obLongTouch  = bullOBActive and low <= bullOBTop and close >= bullOBBot
+fvgLongTouch = bullFVGActive and low <= bullFVGTop and close >= bullFVGBot
+
+longStructure  = trend == 1
+longPD         = inDiscount
+longPOI        = obLongTouch or fvgLongTouch
+longOTE        = inOTEZone
+longKZ         = inKillZone
+longSweep      = sweepBelow
+
+// Score-based entry: need at least structure + POI + one more
+longScore = 0
+if longStructure
+    longScore += 2
+if longPD
+    longScore += 1
+if longPOI
+    longScore += 2
+if longOTE
+    longScore += 1
+if longKZ
+    longScore += 1
+if longSweep
+    longScore += 1
+
+longCondition = longScore >= 5 and strategy.position_size == 0
+
+// SHORT ENTRY: Bearish confluence
+obShortTouch  = bearOBActive and high >= bearOBBot and close <= bearOBTop
+fvgShortTouch = bearFVGActive and high >= bearFVGBot and close <= bearFVGTop
+
+shortStructure = trend == -1
+shortPD        = inPremium
+shortPOI       = obShortTouch or fvgShortTouch
+shortOTE       = inOTEZone
+shortKZ        = inKillZone
+shortSweep     = sweepAbove
+
+shortScore = 0
+if shortStructure
+    shortScore += 2
+if shortPD
+    shortScore += 1
+if shortPOI
+    shortScore += 2
+if shortOTE
+    shortScore += 1
+if shortKZ
+    shortScore += 1
+if shortSweep
+    shortScore += 1
+
+shortCondition = shortScore >= 5 and strategy.position_size == 0
+
+// ─── TRADE EXECUTION ─────────────────────────────────────────────────────────
+
+longSL  = close - atrVal * slAtrMult
+longTP  = close + atrVal * tpAtrMult
+shortSL = close + atrVal * slAtrMult
+shortTP = close - atrVal * tpAtrMult
+trailPts = atrVal * trailAtrMult / syminfo.mintick
+
+if longCondition
+    strategy.entry("ICT Long", strategy.long)
+    if useTrailingStop
+        strategy.exit("Long Exit", "ICT Long", stop=longSL, trail_points=trailPts, trail_offset=trailPts)
+    else
+        strategy.exit("Long Exit", "ICT Long", stop=longSL, limit=longTP)
+
+if shortCondition
+    strategy.entry("ICT Short", strategy.short)
+    if useTrailingStop
+        strategy.exit("Short Exit", "ICT Short", stop=shortSL, trail_points=trailPts, trail_offset=trailPts)
+    else
+        strategy.exit("Short Exit", "ICT Short", stop=shortSL, limit=shortTP)
+
+// ─── PLOTS ────────────────────────────────────────────────────────────────────
+
+// Market structure
+plotshape(not na(swingHigh), "Swing High", shape.diamond, location.abovebar, color.new(color.orange, 0), offset=-swingLen, size=size.tiny)
+plotshape(not na(swingLow),  "Swing Low",  shape.diamond, location.belowbar, color.new(color.blue, 0),   offset=-swingLen, size=size.tiny)
+
+// Structure breaks
+plotshape(bullishBOS,   "Bullish BOS",   shape.labelup,   location.belowbar, color.new(color.green, 0),  size=size.tiny, text="BOS")
+plotshape(bearishBOS,   "Bearish BOS",   shape.labeldown, location.abovebar, color.new(color.red, 0),    size=size.tiny, text="BOS")
+plotshape(bullishCHoCH, "Bullish CHoCH", shape.labelup,   location.belowbar, color.new(color.lime, 0),   size=size.tiny, text="CHoCH")
+plotshape(bearishCHoCH, "Bearish CHoCH", shape.labeldown, location.abovebar, color.new(color.fuchsia, 0), size=size.tiny, text="CHoCH")
+
+// Equilibrium
+plot(equilibrium, "Equilibrium", color=color.new(color.gray, 60), style=plot.style_cross, linewidth=1)
+
+// Previous day levels
+plot(prevDayHigh, "PDH", color=color.new(color.red, 70),   style=plot.style_stepline, linewidth=1)
+plot(prevDayLow,  "PDL", color=color.new(color.green, 70), style=plot.style_stepline, linewidth=1)
+
+// Liquidity sweeps
+plotshape(sweepAbove, "Sweep Above", shape.xcross, location.abovebar, color.new(color.red, 0),   size=size.tiny)
+plotshape(sweepBelow, "Sweep Below", shape.xcross, location.belowbar, color.new(color.green, 0), size=size.tiny)
+
+// Entry signals
+plotshape(longCondition,  "Long Entry",  shape.triangleup,   location.belowbar, color.new(#00E676, 0), size=size.normal, text="ICT\nLONG")
+plotshape(shortCondition, "Short Entry", shape.triangledown, location.abovebar, color.new(#FF1744, 0), size=size.normal, text="ICT\nSHORT")
+
+// Order Block zones
+bullOBColor = bullOBActive ? color.new(color.green, 80) : na
+bearOBColor = bearOBActive ? color.new(color.red, 80) : na
+
+// Kill zone background
+killColor = inLondonKZ ? color.new(color.blue, 93) : inNYKZ ? color.new(color.orange, 93) : inAsiaKZ ? color.new(color.purple, 93) : na
+bgcolor(useKillZones ? killColor : na, title="Kill Zone")
+
+// Premium/Discount background
+bgcolor(inDiscount ? color.new(color.green, 95) : inPremium ? color.new(color.red, 95) : na, title="Premium/Discount")
+
+// ─── INFO TABLE ───────────────────────────────────────────────────────────────
+
+var table infoPanel = table.new(position.top_right, 2, 10, bgcolor=color.new(#1a1a2e, 10), border_width=1, border_color=color.new(color.gray, 70))
+
+if barstate.islast
+    table.cell(infoPanel, 0, 0, "ICT PANEL",        text_color=#00E676, text_size=size.small, text_halign=text.align_left)
+    table.cell(infoPanel, 1, 0, "",                  text_size=size.small)
+
+    table.cell(infoPanel, 0, 1, "Trend",             text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(infoPanel, 1, 1, trend == 1 ? "BULLISH" : "BEARISH", text_color=trend == 1 ? color.green : color.red, text_size=size.small)
+
+    table.cell(infoPanel, 0, 2, "Zone",              text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(infoPanel, 1, 2, inDiscount ? "DISCOUNT" : "PREMIUM", text_color=inDiscount ? color.green : color.red, text_size=size.small)
+
+    table.cell(infoPanel, 0, 3, "Kill Zone",         text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    kzText = inLondonKZ ? "LONDON" : inNYKZ ? "NEW YORK" : inAsiaKZ ? "ASIA" : "NONE"
+    table.cell(infoPanel, 1, 3, kzText, text_color=inKillZone and useKillZones ? color.yellow : color.gray, text_size=size.small)
+
+    table.cell(infoPanel, 0, 4, "Bull OB",           text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(infoPanel, 1, 4, bullOBActive ? "ACTIVE" : "NONE", text_color=bullOBActive ? color.green : color.gray, text_size=size.small)
+
+    table.cell(infoPanel, 0, 5, "Bear OB",           text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(infoPanel, 1, 5, bearOBActive ? "ACTIVE" : "NONE", text_color=bearOBActive ? color.red : color.gray, text_size=size.small)
+
+    table.cell(infoPanel, 0, 6, "Bull FVG",          text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(infoPanel, 1, 6, bullFVGActive ? "ACTIVE" : "NONE", text_color=bullFVGActive ? color.green : color.gray, text_size=size.small)
+
+    table.cell(infoPanel, 0, 7, "Bear FVG",          text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(infoPanel, 1, 7, bearFVGActive ? "ACTIVE" : "NONE", text_color=bearFVGActive ? color.red : color.gray, text_size=size.small)
+
+    table.cell(infoPanel, 0, 8, "Long Score",        text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(infoPanel, 1, 8, str.tostring(longScore) + "/8", text_color=longScore >= 5 ? color.green : color.gray, text_size=size.small)
+
+    table.cell(infoPanel, 0, 9, "Short Score",       text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(infoPanel, 1, 9, str.tostring(shortScore) + "/8", text_color=shortScore >= 5 ? color.red : color.gray, text_size=size.small)
