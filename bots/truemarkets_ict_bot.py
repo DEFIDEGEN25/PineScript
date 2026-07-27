@@ -1,8 +1,9 @@
 """
 ICT Spot Trading Bot for TrueMarkets (TrueX)
 
-Standalone algo that runs ICT analysis and executes spot trades
+Standalone algo that runs ICT analysis and executes spot-only trades
 on BTC/USD, ETH/USD, SOL/USD via the TrueMarkets REST API.
+SPOT ONLY: Buy to enter, sell to exit. No shorting.
 
 Also exposes a webhook endpoint for TradingView alert-driven trading.
 
@@ -321,7 +322,6 @@ class FairValueGap:
 
 @dataclass
 class ICTSignal:
-    action: str
     asset: str
     price: float
     score: int
@@ -339,7 +339,6 @@ class ICTSignal:
 @dataclass
 class Position:
     asset: str
-    side: str
     entry_price: float
     qty: float
     order_id: str
@@ -543,16 +542,17 @@ class ICTAnalyzer:
         pd_zone = self.get_premium_discount(candles)
         in_ote = self.check_ote_zone(candles, swings)
         kill_zone = self.get_kill_zone()
-        sweep_above, sweep_below = self.check_liquidity_sweep(candles)
+        _sweep_above, sweep_below = self.check_liquidity_sweep(candles)
 
         price = candles[-1].close
 
-        # ── Score long setup ──
-        long_score = 0
+        # Spot only: score buy setup, never short
+        buy_score = 0
         if trend == Trend.BULLISH:
-            long_score += 2
+            buy_score += 2
         if pd_zone == "discount":
-            long_score += 1
+            buy_score += 1
+
         bull_ob_touch = any(
             ob.is_bullish and candles[-1].low <= ob.top and candles[-1].close >= ob.bottom
             for ob in obs
@@ -562,57 +562,22 @@ class ICTAnalyzer:
             for f in fvgs
         )
         if bull_ob_touch or bull_fvg_touch:
-            long_score += 2
+            buy_score += 2
         if in_ote:
-            long_score += 1
+            buy_score += 1
         if kill_zone != "none":
-            long_score += 1
+            buy_score += 1
         if sweep_below:
-            long_score += 1
+            buy_score += 1
 
-        # ── Score short setup ──
-        short_score = 0
-        if trend == Trend.BEARISH:
-            short_score += 2
-        if pd_zone == "premium":
-            short_score += 1
-        bear_ob_touch = any(
-            not ob.is_bullish and candles[-1].high >= ob.bottom and candles[-1].close <= ob.top
-            for ob in obs
-        )
-        bear_fvg_touch = any(
-            not f.is_bullish and candles[-1].high >= f.bottom and candles[-1].close <= f.top
-            for f in fvgs
-        )
-        if bear_ob_touch or bear_fvg_touch:
-            short_score += 2
-        if in_ote:
-            short_score += 1
-        if kill_zone != "none":
-            short_score += 1
-        if sweep_above:
-            short_score += 1
-
-        min_score = self.cfg.min_entry_score
-
-        if long_score >= min_score and long_score > short_score:
+        if buy_score >= self.cfg.min_entry_score:
             return ICTSignal(
-                action="buy", asset=asset, price=price, score=long_score,
+                asset=asset, price=price, score=buy_score,
                 stop_loss=price - atr * self.cfg.sl_atr_mult,
                 take_profit=price + atr * self.cfg.tp_atr_mult,
                 structure=structure or "trend", zone=pd_zone, kill_zone=kill_zone,
                 order_block=bull_ob_touch, fvg=bull_fvg_touch,
                 ote=in_ote, liquidity_sweep=sweep_below,
-            )
-
-        if short_score >= min_score and short_score > long_score:
-            return ICTSignal(
-                action="sell", asset=asset, price=price, score=short_score,
-                stop_loss=price + atr * self.cfg.sl_atr_mult,
-                take_profit=price - atr * self.cfg.tp_atr_mult,
-                structure=structure or "trend", zone=pd_zone, kill_zone=kill_zone,
-                order_block=bear_ob_touch, fvg=bear_fvg_touch,
-                ote=in_ote, liquidity_sweep=sweep_above,
             )
 
         return None
@@ -708,7 +673,7 @@ class TradeManager:
                 order = self.client.create_order(
                     base=signal.asset,
                     quote=self.cfg.quote_asset,
-                    side=signal.action,
+                    side="buy",
                     quantity=str(qty),
                     price=str(signal.price),
                     order_type="limit",
@@ -717,7 +682,7 @@ class TradeManager:
                 order_id = order.get("order_id") or order.get("id", "unknown")
 
                 position = Position(
-                    asset=signal.asset, side=signal.action,
+                    asset=signal.asset,
                     entry_price=signal.price, qty=float(qty),
                     order_id=order_id,
                     stop_loss=signal.stop_loss,
@@ -729,8 +694,8 @@ class TradeManager:
                 self.daily_trades += 1
 
                 log.info(
-                    "TRADE EXECUTED: %s %s %s @ %.2f | SL=%.2f TP=%.2f | score=%d [%s %s %s]",
-                    signal.action.upper(), qty, signal.asset, signal.price,
+                    "BUY EXECUTED: %s %s @ %.2f | SL=%.2f TP=%.2f | score=%d [%s %s %s]",
+                    qty, signal.asset, signal.price,
                     signal.stop_loss, signal.take_profit, signal.score,
                     signal.structure, signal.zone, signal.kill_zone,
                 )
@@ -738,7 +703,7 @@ class TradeManager:
                 return {
                     "order_id": order_id,
                     "asset": signal.asset,
-                    "side": signal.action,
+                    "side": "buy",
                     "qty": str(qty),
                     "price": signal.price,
                     "sl": signal.stop_loss,
@@ -755,24 +720,17 @@ class TradeManager:
             return
         closed = []
         for asset, pos in self.positions.items():
-            exit_side = "sell" if pos.side == "buy" else "buy"
-            current_price = self.get_current_price(asset, exit_side)
+            current_price = self.get_current_price(asset, "sell")
             if current_price <= 0:
                 continue
 
             should_close = False
             close_reason = ""
 
-            if pos.side == "buy":
-                if current_price <= pos.stop_loss:
-                    should_close, close_reason = True, "STOP LOSS"
-                elif current_price >= pos.take_profit:
-                    should_close, close_reason = True, "TAKE PROFIT"
-            else:
-                if current_price >= pos.stop_loss:
-                    should_close, close_reason = True, "STOP LOSS"
-                elif current_price <= pos.take_profit:
-                    should_close, close_reason = True, "TAKE PROFIT"
+            if current_price <= pos.stop_loss:
+                should_close, close_reason = True, "STOP LOSS"
+            elif current_price >= pos.take_profit:
+                should_close, close_reason = True, "TAKE PROFIT"
 
             if should_close:
                 self._close_position(pos, current_price, close_reason)
@@ -783,29 +741,26 @@ class TradeManager:
 
     def _close_position(self, pos: Position, current_price: float, reason: str):
         try:
-            exit_side = "sell" if pos.side == "buy" else "buy"
             self.client.create_order(
                 base=pos.asset,
                 quote=self.cfg.quote_asset,
-                side=exit_side,
+                side="sell",
                 quantity=str(pos.qty),
                 price=str(current_price),
                 order_type="limit",
             )
 
             pnl = (current_price - pos.entry_price) * pos.qty
-            if pos.side == "sell":
-                pnl = -pnl
             self.daily_pnl += pnl
 
             log.info(
-                "CLOSED [%s]: %s %s @ %.2f -> %.2f | PnL=%.2f %s",
-                reason, pos.side.upper(), pos.asset,
+                "SOLD [%s]: %s @ %.2f -> %.2f | PnL=%.2f %s",
+                reason, pos.asset,
                 pos.entry_price, current_price, pnl, self.cfg.quote_asset,
             )
 
             self.trade_history.append({
-                "asset": pos.asset, "side": pos.side,
+                "asset": pos.asset, "side": "buy",
                 "entry": pos.entry_price, "exit": current_price,
                 "pnl": round(pnl, 2), "reason": reason,
                 "duration_min": round((time.time() - pos.entry_time) / 60, 1),
@@ -818,7 +773,7 @@ class TradeManager:
         return {
             "positions": {
                 asset: {
-                    "side": p.side, "entry": p.entry_price,
+                    "side": "long", "entry": p.entry_price,
                     "qty": p.qty, "sl": p.stop_loss, "tp": p.take_profit,
                     "age_min": int((time.time() - p.entry_time) / 60),
                 }
@@ -895,8 +850,8 @@ def run_algo_loop(config: BotConfig, client: TrueMarketsClient, manager: TradeMa
                 signal = analyzer.analyze(asset, candles)
                 if signal:
                     log.info(
-                        "SIGNAL: %s %s | score=%d/8 | %s %s kz=%s | OB=%s FVG=%s OTE=%s sweep=%s",
-                        signal.action.upper(), signal.asset, signal.score,
+                        "BUY SIGNAL: %s | score=%d/8 | %s %s kz=%s | OB=%s FVG=%s OTE=%s sweep=%s",
+                        signal.asset, signal.score,
                         signal.structure, signal.zone, signal.kill_zone,
                         signal.order_block, signal.fvg, signal.ote, signal.liquidity_sweep,
                     )
@@ -935,15 +890,15 @@ def create_webhook_app(config: BotConfig, manager: TradeManager):
         price = float(data.get("price", 0))
         score = int(data.get("score", 0))
 
-        if action not in ("buy", "sell") or asset not in config.assets or price <= 0:
-            return jfy({"status": "rejected", "reason": "Invalid signal"}), 400
+        if action != "buy" or asset not in config.assets or price <= 0:
+            return jfy({"status": "rejected", "reason": "Spot only: action must be 'buy'"}), 400
 
         atr_est = price * 0.02
-        sl = float(data.get("sl", price + (-1 if action == "buy" else 1) * atr_est * config.sl_atr_mult))
-        tp = float(data.get("tp", price + (1 if action == "buy" else -1) * atr_est * config.tp_atr_mult))
+        sl = float(data.get("sl", price - atr_est * config.sl_atr_mult))
+        tp = float(data.get("tp", price + atr_est * config.tp_atr_mult))
 
         signal = ICTSignal(
-            action=action, asset=asset, price=price, score=score,
+            asset=asset, price=price, score=score,
             stop_loss=sl, take_profit=tp,
             structure=data.get("structure", "webhook"),
             zone=data.get("zone", "n/a"),
