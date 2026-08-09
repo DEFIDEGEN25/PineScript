@@ -1,0 +1,339 @@
+// Quant Futures Multi-Strategy Framework
+// Composite signal engine combining Trend/Momentum, Mean Reversion,
+// and Funding Rate Proxy sub-strategies for crypto futures.
+//
+// Sub-strategies:
+//   1. Trend/Momentum  — Dual EMA crossover + ADX + RSI + Volume
+//   2. Mean Reversion   — Bollinger Bands z-score + RSI divergence
+//   3. Funding Proxy    — Basis vs 50-SMA as funding rate stand-in
+//
+// Risk layer: ATR stops, trailing stop, Kelly-inspired sizing,
+// max-drawdown circuit breaker.
+
+//@version=6
+strategy("Quant Futures Multi-Strategy", overlay=true,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=5,
+     commission_type=strategy.commission.percent,
+     commission_value=0.06,
+     slippage=3,
+     initial_capital=100000,
+     process_orders_on_close=false,
+     pyramiding=0)
+
+// ─── INPUTS ──────────────────────────────────────────────────────────────────
+
+// Momentum
+ema_fast        = input.int(12,    "EMA Fast",               minval=2,   group="Momentum")
+ema_slow        = input.int(26,    "EMA Slow",               minval=2,   group="Momentum")
+adx_len         = input.int(14,    "ADX Length",              minval=5,   group="Momentum")
+adx_thresh      = input.float(20,  "ADX Threshold",           minval=5,   group="Momentum")
+rsi_len         = input.int(14,    "RSI Length",              minval=2,   group="Momentum")
+vol_mult        = input.float(1.5, "Volume SMA Multiplier",   minval=1.0, group="Momentum")
+
+// Mean Reversion
+bb_len          = input.int(20,    "BB Length",               minval=5,   group="Mean Reversion")
+bb_mult         = input.float(2.0, "BB Std Dev Multiplier",   minval=0.5, group="Mean Reversion")
+zscore_long     = input.float(-2.0,"Z-Score Long Threshold",  maxval=0,   group="Mean Reversion")
+zscore_short    = input.float(2.0, "Z-Score Short Threshold",  minval=0,   group="Mean Reversion")
+rsi_oversold    = input.int(30,    "RSI Oversold",            minval=5,   maxval=50, group="Mean Reversion")
+rsi_overbought  = input.int(70,    "RSI Overbought",          minval=50,  maxval=95, group="Mean Reversion")
+
+// Funding Rate Proxy
+basis_len            = input.int(50,    "Basis SMA Length",        minval=10,  group="Funding Proxy")
+basis_long_thresh    = input.float(-1.5,"Basis Long Threshold %",  maxval=0,   group="Funding Proxy")
+basis_short_thresh   = input.float(1.5, "Basis Short Threshold %", minval=0,   group="Funding Proxy")
+
+// Risk
+atr_len         = input.int(14,    "ATR Length",              minval=5,   group="Risk")
+sl_mult         = input.float(2.0, "Stop Loss ATR Mult",      minval=0.5, group="Risk")
+tp_mult         = input.float(4.0, "Take Profit ATR Mult",    minval=1.0, group="Risk")
+trail_mult      = input.float(2.5, "Trailing Stop ATR Mult",  minval=0.5, group="Risk")
+max_dd_pct      = input.float(10,  "Max Drawdown %",          minval=1,   maxval=50, group="Risk")
+max_pos_pct     = input.float(10,  "Max Position % Equity",   minval=1,   maxval=50, group="Risk")
+kelly_lookback  = input.int(50,    "Kelly Lookback Trades",   minval=10,  group="Risk")
+
+// Session Filter
+use_session     = input.bool(false,"Use Session Filter",                  group="Filters")
+session_start   = input.int(8,     "Session Start (UTC Hour)", minval=0,  maxval=23, group="Filters")
+session_end     = input.int(20,    "Session End (UTC Hour)",   minval=0,  maxval=23, group="Filters")
+
+// ─── CORE INDICATORS ─────────────────────────────────────────────────────────
+
+// EMAs
+ema_f = ta.ema(close, ema_fast)
+ema_s = ta.ema(close, ema_slow)
+
+// ADX via Directional Movement
+// Pine v6 ta.dmi returns [plus, minus, adx]
+[di_plus, di_minus, adx_val] = ta.dmi(adx_len, adx_len)
+
+// RSI
+rsi_val = ta.rsi(close, rsi_len)
+
+// Volume filter
+vol_sma = ta.sma(volume, 20)
+vol_ok  = volume > vol_mult * vol_sma
+
+// Bollinger Bands
+bb_basis = ta.sma(close, bb_len)
+bb_dev   = ta.stdev(close, bb_len)
+bb_upper = bb_basis + bb_mult * bb_dev
+bb_lower = bb_basis - bb_mult * bb_dev
+
+// Z-score of price relative to BB midline
+zscore = bb_dev > 0 ? (close - bb_basis) / bb_dev : 0.0
+
+// ATR
+atr_val = ta.atr(atr_len)
+
+// Basis (funding proxy)
+basis_sma  = ta.sma(close, basis_len)
+basis_pct  = basis_sma > 0 ? (close - basis_sma) / basis_sma * 100.0 : 0.0
+
+// ─── SESSION FILTER ──────────────────────────────────────────────────────────
+
+utc_hour = hour(time, "UTC")
+in_session = not use_session or (session_start < session_end ?
+     (utc_hour >= session_start and utc_hour < session_end) :
+     (utc_hour >= session_start or utc_hour < session_end))
+
+// ─── SUB-STRATEGY 1: TREND / MOMENTUM ───────────────────────────────────────
+
+ema_bull = ema_f > ema_s
+ema_bear = ema_f < ema_s
+adx_ok   = adx_val > adx_thresh
+
+rsi_bull_mom = rsi_val > 50 and rsi_val < 80
+rsi_bear_mom = rsi_val < 50 and rsi_val > 20
+
+trend_long  = ema_bull and adx_ok and rsi_bull_mom and vol_ok
+trend_short = ema_bear and adx_ok and rsi_bear_mom and vol_ok
+
+score_trend = trend_long ? 2 : trend_short ? -2 : 0
+
+// ─── SUB-STRATEGY 2: MEAN REVERSION ─────────────────────────────────────────
+
+mr_long  = zscore < zscore_long  and rsi_val < rsi_oversold
+mr_short = zscore > zscore_short and rsi_val > rsi_overbought
+
+score_mr = mr_long ? 2 : mr_short ? -2 : 0
+
+// ─── SUB-STRATEGY 3: FUNDING RATE PROXY ─────────────────────────────────────
+
+funding_long  = basis_pct < basis_long_thresh
+funding_short = basis_pct > basis_short_thresh
+
+score_fund = funding_long ? 1 : funding_short ? -1 : 0
+
+// ─── COMPOSITE SIGNAL ────────────────────────────────────────────────────────
+
+composite = score_trend + score_mr + score_fund   // range: -5 to +5
+
+// ─── DRAWDOWN CIRCUIT BREAKER ────────────────────────────────────────────────
+
+var float equity_peak = strategy.initial_capital
+equity_peak := math.max(equity_peak, strategy.equity)
+current_dd_pct = equity_peak > 0 ? (equity_peak - strategy.equity) / equity_peak * 100.0 : 0.0
+circuit_open = current_dd_pct < max_dd_pct
+
+// Reset circuit breaker when equity recovers to new peak
+// (equity_peak update above handles this automatically)
+
+// ─── KELLY-INSPIRED POSITION SIZING ─────────────────────────────────────────
+
+// Gather closed-trade statistics for Kelly estimation
+total_closed = strategy.closedtrades
+lookback_n   = math.min(total_closed, kelly_lookback)
+
+var float kelly_pct = 5.0   // default 5% of equity
+
+if lookback_n >= 10
+    int   wins    = 0
+    float sum_win = 0.0
+    float sum_loss = 0.0
+    int   losses  = 0
+    for i = total_closed - lookback_n to total_closed - 1
+        float pnl = strategy.closedtrades.profit(i)
+        if pnl > 0
+            wins    += 1
+            sum_win += pnl
+        else if pnl < 0
+            losses   += 1
+            sum_loss += math.abs(pnl)
+    float win_rate  = wins > 0 ? wins / float(lookback_n) : 0.0
+    float avg_win   = wins > 0 ? sum_win / wins : 0.0
+    float avg_loss  = losses > 0 ? sum_loss / losses : 1.0
+    float wl_ratio  = avg_loss > 0 ? avg_win / avg_loss : 1.0
+    // Kelly fraction: W - (1 - W) / R
+    float kelly_raw = wl_ratio > 0 ? win_rate - (1.0 - win_rate) / wl_ratio : 0.0
+    // Half-Kelly for safety, clamped to [1%, max_pos_pct]
+    kelly_pct := math.max(1.0, math.min(max_pos_pct, kelly_raw * 0.5 * 100.0))
+else
+    kelly_pct := 5.0
+
+// ─── ENTRY / EXIT LOGIC ─────────────────────────────────────────────────────
+
+is_long  = strategy.position_size > 0
+is_short = strategy.position_size < 0
+is_flat  = strategy.position_size == 0
+
+// Entry conditions
+long_entry  = composite >= 3  and is_flat and in_session and circuit_open
+short_entry = composite <= -3 and is_flat and in_session and circuit_open
+
+// Exit conditions (signal-based)
+close_long_signal  = composite <= 0
+close_short_signal = composite >= 0
+
+// ATR-based stop/TP levels
+long_sl  = close - sl_mult    * atr_val
+long_tp  = close + tp_mult    * atr_val
+short_sl = close + sl_mult    * atr_val
+short_tp = close - tp_mult    * atr_val
+
+// Persist entry-bar ATR for trailing stop
+var float entry_atr = na
+
+// ─── ORDER EXECUTION ─────────────────────────────────────────────────────────
+
+if long_entry
+    entry_atr := atr_val
+    strategy.entry("Long", strategy.long, qty=kelly_pct,
+         comment="L | C=" + str.tostring(composite))
+    strategy.exit("Long TP/SL", "Long",
+         stop=long_sl, limit=long_tp,
+         trail_points=trail_mult * atr_val / syminfo.mintick,
+         trail_offset=trail_mult * atr_val / syminfo.mintick)
+
+if short_entry
+    entry_atr := atr_val
+    strategy.entry("Short", strategy.short, qty=kelly_pct,
+         comment="S | C=" + str.tostring(composite))
+    strategy.exit("Short TP/SL", "Short",
+         stop=short_sl, limit=short_tp,
+         trail_points=trail_mult * atr_val / syminfo.mintick,
+         trail_offset=trail_mult * atr_val / syminfo.mintick)
+
+// Signal-based exits
+if is_long and close_long_signal
+    strategy.close("Long", comment="Exit L | C=" + str.tostring(composite))
+
+if is_short and close_short_signal
+    strategy.close("Short", comment="Exit S | C=" + str.tostring(composite))
+
+// Circuit breaker forced exit
+if not circuit_open and not is_flat
+    strategy.close_all(comment="CIRCUIT BREAKER")
+
+// ─── PLOTS ───────────────────────────────────────────────────────────────────
+
+// EMA lines
+plot(ema_f, "EMA Fast", color=color.new(color.teal, 0),   linewidth=2)
+plot(ema_s, "EMA Slow", color=color.new(color.orange, 0), linewidth=2)
+
+// Bollinger Bands
+p_bb_upper = plot(bb_upper, "BB Upper", color=color.new(color.gray, 60))
+p_bb_lower = plot(bb_lower, "BB Lower", color=color.new(color.gray, 60))
+plot(bb_basis, "BB Basis", color=color.new(color.gray, 30), linewidth=1)
+fill(p_bb_upper, p_bb_lower, color=color.new(color.blue, 92), title="BB Fill")
+
+// Entry / exit markers
+plotshape(long_entry,  title="Long Entry",  style=shape.triangleup,
+     location=location.belowbar, color=color.new(color.green, 0), size=size.small)
+plotshape(short_entry, title="Short Entry", style=shape.triangledown,
+     location=location.abovebar, color=color.new(color.red, 0),   size=size.small)
+
+plotshape(is_long  and close_long_signal,  title="Close Long",  style=shape.xcross,
+     location=location.abovebar, color=color.new(color.green, 40), size=size.tiny)
+plotshape(is_short and close_short_signal, title="Close Short", style=shape.xcross,
+     location=location.belowbar, color=color.new(color.red, 40),   size=size.tiny)
+
+// Session background
+bgcolor(use_session and not in_session ? color.new(color.gray, 93) : na,
+     title="Out-of-Session")
+
+// Circuit breaker background
+bgcolor(not circuit_open ? color.new(color.red, 90) : na,
+     title="Circuit Breaker Active")
+
+// ─── INFO TABLE ──────────────────────────────────────────────────────────────
+
+var table infoTbl = table.new(position.top_right, 2, 9,
+     bgcolor=color.new(#1e1e1e, 0),
+     border_color=color.new(#333333, 0),
+     border_width=1,
+     frame_color=color.new(#333333, 0),
+     frame_width=2)
+
+// Helper: build active-strategy label
+active_strats() =>
+    string out = ""
+    if score_trend != 0
+        out += (score_trend > 0 ? "MOM+" : "MOM-")
+    if score_mr != 0
+        out += (str.length(out) > 0 ? " | " : "") + (score_mr > 0 ? "MR+" : "MR-")
+    if score_fund != 0
+        out += (str.length(out) > 0 ? " | " : "") + (score_fund > 0 ? "FND+" : "FND-")
+    out == "" ? "None" : out
+
+// Trend label
+trend_label() =>
+    ema_f > ema_s ? "Bullish" : ema_f < ema_s ? "Bearish" : "Neutral"
+
+// Position label
+pos_label() =>
+    is_long ? "LONG" : is_short ? "SHORT" : "FLAT"
+
+// Win rate from closed trades
+calc_win_rate() =>
+    if total_closed == 0
+        0.0
+    else
+        int w = 0
+        for i = 0 to total_closed - 1
+            if strategy.closedtrades.profit(i) > 0
+                w += 1
+        w / float(total_closed) * 100.0
+
+// Sharpe estimate (from recent closed trades, annualized approx)
+calc_sharpe() =>
+    int n = math.min(total_closed, kelly_lookback)
+    if n < 2
+        0.0
+    else
+        float sum_r  = 0.0
+        float sum_r2 = 0.0
+        for i = total_closed - n to total_closed - 1
+            float r = strategy.closedtrades.profit(i) / strategy.initial_capital * 100.0
+            sum_r  += r
+            sum_r2 += r * r
+        float mean_r = sum_r / n
+        float var_r  = sum_r2 / n - mean_r * mean_r
+        float std_r  = var_r > 0 ? math.sqrt(var_r) : 0.001
+        float sharpe = mean_r / std_r * math.sqrt(252)
+        math.round(sharpe, 2)
+
+hdr_clr  = color.new(#aaaaaa, 0)
+val_clr  = color.new(#ffffff, 0)
+pos_clr  = is_long ? color.green : is_short ? color.red : color.gray
+
+if barstate.islast
+    table.cell(infoTbl, 0, 0, "Active Strategy",     text_color=hdr_clr, text_size=size.small)
+    table.cell(infoTbl, 1, 0, active_strats(),        text_color=val_clr, text_size=size.small)
+    table.cell(infoTbl, 0, 1, "Composite Score",      text_color=hdr_clr, text_size=size.small)
+    table.cell(infoTbl, 1, 1, str.tostring(composite), text_color=composite > 0 ? color.green : composite < 0 ? color.red : color.gray, text_size=size.small)
+    table.cell(infoTbl, 0, 2, "Trend",                text_color=hdr_clr, text_size=size.small)
+    table.cell(infoTbl, 1, 2, trend_label(),           text_color=ema_f > ema_s ? color.green : color.red, text_size=size.small)
+    table.cell(infoTbl, 0, 3, "ADX",                  text_color=hdr_clr, text_size=size.small)
+    table.cell(infoTbl, 1, 3, str.tostring(math.round(adx_val, 1)) + (adx_ok ? " (strong)" : " (weak)"), text_color=adx_ok ? color.green : color.orange, text_size=size.small)
+    table.cell(infoTbl, 0, 4, "Position",             text_color=hdr_clr, text_size=size.small)
+    table.cell(infoTbl, 1, 4, pos_label(),             text_color=pos_clr, text_size=size.small)
+    table.cell(infoTbl, 0, 5, "Drawdown %",           text_color=hdr_clr, text_size=size.small)
+    table.cell(infoTbl, 1, 5, str.tostring(math.round(current_dd_pct, 2)) + "%", text_color=current_dd_pct > max_dd_pct * 0.5 ? color.orange : color.gray, text_size=size.small)
+    table.cell(infoTbl, 0, 6, "Win Rate",             text_color=hdr_clr, text_size=size.small)
+    table.cell(infoTbl, 1, 6, str.tostring(math.round(calc_win_rate(), 1)) + "%", text_color=val_clr, text_size=size.small)
+    table.cell(infoTbl, 0, 7, "Sharpe (est)",         text_color=hdr_clr, text_size=size.small)
+    table.cell(infoTbl, 1, 7, str.tostring(calc_sharpe()), text_color=val_clr, text_size=size.small)
+    table.cell(infoTbl, 0, 8, "Kelly Size %",         text_color=hdr_clr, text_size=size.small)
+    table.cell(infoTbl, 1, 8, str.tostring(math.round(kelly_pct, 1)) + "%", text_color=val_clr, text_size=size.small)
